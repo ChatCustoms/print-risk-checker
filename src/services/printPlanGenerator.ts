@@ -1,0 +1,292 @@
+import { ModelInput, PrinterMaterial, PrintPlan, RiskLevel } from '../types/index.ts';
+import { WALL_RECOMMENDATIONS, INFILL_RECOMMENDATIONS, MATERIAL_PROPERTIES } from '../utils/constants.ts';
+
+// Generate orientation recommendation
+const generateOrientation = (model: ModelInput): string => {
+  if (model.flatBase === 'yes') {
+    return 'Print with flat base down for best adhesion and stability';
+  }
+  if (model.flatBase === 'no') {
+    return 'No flat base detected - consider reorienting to maximize contact area with bed. Use supports if needed.';
+  }
+  return 'Orient model to maximize bed contact area and minimize overhangs';
+};
+
+// Generate support recommendations
+const generateSupportsRecommendation = (
+  model: ModelInput,
+  printer: PrinterMaterial
+): { enabled: boolean; details: string } => {
+  if (!printer.supportsAllowed) {
+    if (model.overhangs === 'many' || model.overhangs === 'some') {
+      return {
+        enabled: false,
+        details: 'Supports disabled but recommended for overhangs. Consider enabling supports or reorienting model.',
+      };
+    }
+    return {
+      enabled: false,
+      details: 'Supports disabled - ensure no overhangs exceed 45-50°',
+    };
+  }
+
+  if (model.overhangs === 'many') {
+    return {
+      enabled: true,
+      details: 'Use tree supports for easier removal. Enable support interface layers for better surface finish.',
+    };
+  }
+
+  if (model.overhangs === 'some') {
+    return {
+      enabled: true,
+      details: 'Use supports for overhangs >50-60°. Consider manual support placement for critical areas.',
+    };
+  }
+
+  if (model.bridges === 'many') {
+    return {
+      enabled: true,
+      details: 'Minimal supports for bridges. Test bridge settings first - may not need full supports.',
+    };
+  }
+
+  return {
+    enabled: false,
+    details: 'Supports not required for this geometry',
+  };
+};
+
+// Calculate wall count
+const calculateWalls = (model: ModelInput, printer: PrinterMaterial): number => {
+  const baseWalls = WALL_RECOMMENDATIONS[model.intendedUse];
+
+  // Adjust for thin walls
+  if (typeof model.minWallThickness === 'number') {
+    const minRecommended = printer.nozzleSize * 1.5;
+    if (model.minWallThickness < minRecommended) {
+      return Math.max(baseWalls, 3); // More walls for thin features
+    }
+  }
+
+  return baseWalls;
+};
+
+// Calculate infill
+const calculateInfill = (
+  model: ModelInput,
+  printer: PrinterMaterial
+): { percentage: number; pattern: string } => {
+  const baseRec = INFILL_RECOMMENDATIONS[printer.priority];
+
+  // Adjust for use case
+  if (model.intendedUse === 'functional') {
+    return {
+      pattern: 'gyroid',
+      percentage: 30,
+    };
+  }
+
+  if (model.intendedUse === 'fit-critical') {
+    return {
+      pattern: 'cubic',
+      percentage: 20,
+    };
+  }
+
+  // Decorative
+  if (printer.priority === 'speed') {
+    return {
+      pattern: 'lines',
+      percentage: 10,
+    };
+  }
+
+  return {
+    pattern: baseRec.pattern,
+    percentage: parseInt(baseRec.range.split('-')[0]),
+  };
+};
+
+// Generate adhesion recommendation
+const generateAdhesionRecommendation = (
+  model: ModelInput,
+  printer: PrinterMaterial
+): 'none' | 'brim' | 'raft' => {
+  // Raft for difficult materials
+  if (printer.material === 'ABS' || printer.material === 'Nylon') {
+    const largestDimension = Math.max(model.boundingBox.x, model.boundingBox.y);
+    if (largestDimension > 100) {
+      return 'raft';
+    }
+  }
+
+  // Brim for no flat base or tall parts
+  const footprint = Math.min(model.boundingBox.x, model.boundingBox.y);
+  const aspectRatio = model.boundingBox.z / footprint;
+
+  if (model.flatBase === 'no' || aspectRatio > 2.5) {
+    return 'brim';
+  }
+
+  if (footprint < 50) {
+    return 'brim';
+  }
+
+  // TPU often needs help
+  if (printer.material === 'TPU') {
+    return 'brim';
+  }
+
+  return 'none';
+};
+
+// Generate speed notes
+const generateSpeedNotes = (model: ModelInput, printer: PrinterMaterial, riskLevel: RiskLevel): string => {
+  const notes: string[] = [];
+
+  if (riskLevel === 'high') {
+    notes.push('Reduce overall print speed by 20-30%');
+  }
+
+  if (printer.priority === 'speed' && model.intendedUse === 'fit-critical') {
+    notes.push('Slow down outer walls to 50% speed for dimensional accuracy');
+  }
+
+  if (model.overhangs === 'many' || model.bridges === 'many') {
+    notes.push('Reduce speed for overhangs and bridges to 40-60% of normal speed');
+  }
+
+  const footprint = Math.min(model.boundingBox.x, model.boundingBox.y);
+  const aspectRatio = model.boundingBox.z / footprint;
+  if (aspectRatio > 2.5) {
+    notes.push('Reduce speed for tall prints - max 50mm/s for outer walls');
+  }
+
+  if (printer.material === 'TPU') {
+    notes.push('TPU requires slow speeds: 20-40mm/s maximum');
+  }
+
+  if (typeof model.minWallThickness === 'number' && model.minWallThickness < printer.nozzleSize * 2) {
+    notes.push('Slow down for thin walls to prevent gaps');
+  }
+
+  if (notes.length === 0) {
+    if (printer.priority === 'quality') {
+      return 'Use quality preset (slower speeds, better finish)';
+    }
+    if (printer.priority === 'strength') {
+      return 'Moderate speeds recommended for consistent layer bonding';
+    }
+    return 'Standard speeds acceptable for this print';
+  }
+
+  return notes.join('. ');
+};
+
+// Generate material-specific notes
+const generateMaterialNotes = (printer: PrinterMaterial): string => {
+  const materialInfo = MATERIAL_PROPERTIES[printer.material];
+  const notes: string[] = [];
+
+  notes.push(`Temp: ${materialInfo.temperature}, Bed: ${materialInfo.bedTemp}`);
+  notes.push(`Cooling: ${materialInfo.fanSpeed}`);
+  notes.push(materialInfo.notes);
+
+  return notes.join('. ');
+};
+
+// Generate mitigation checklist
+const generateMitigationChecklist = (
+  model: ModelInput,
+  printer: PrinterMaterial,
+  riskLevel: RiskLevel
+): string[] => {
+  const checklist: string[] = [];
+
+  // Always check first layer
+  checklist.push('Verify first layer adhesion and adjust Z-offset if needed');
+
+  // Wall thickness
+  if (typeof model.minWallThickness === 'number') {
+    if (model.minWallThickness < printer.nozzleSize * 2) {
+      checklist.push(`Confirm minimum wall thickness ≥ ${(printer.nozzleSize * 1.5).toFixed(1)}mm`);
+    }
+  }
+
+  // Adhesion
+  const adhesion = generateAdhesionRecommendation(model, printer);
+  if (adhesion !== 'none') {
+    checklist.push(`Add ${adhesion} for better bed adhesion`);
+  }
+
+  // Supports
+  if (model.overhangs === 'many' || model.overhangs === 'some') {
+    checklist.push('Enable supports for overhangs > 50-60°');
+  }
+
+  // Large parts
+  const largestDimension = Math.max(model.boundingBox.x, model.boundingBox.y);
+  if (largestDimension > 150) {
+    checklist.push('Monitor first 10 layers for warping or adhesion issues');
+  }
+
+  // Material-specific
+  if (printer.material === 'PETG') {
+    checklist.push('Reduce cooling fan to 30-50% to prevent layer adhesion issues');
+  }
+
+  if (printer.material === 'ABS' || printer.material === 'Nylon') {
+    checklist.push('Use enclosure if available to prevent warping');
+    checklist.push('Avoid drafts and maintain consistent ambient temperature');
+  }
+
+  if (printer.material === 'Nylon') {
+    checklist.push('Ensure filament is properly dried before printing');
+  }
+
+  if (printer.material === 'TPU') {
+    checklist.push('Reduce retraction settings to prevent jams');
+  }
+
+  // Tall parts
+  const footprint = Math.min(model.boundingBox.x, model.boundingBox.y);
+  const aspectRatio = model.boundingBox.z / footprint;
+  if (aspectRatio > 2.5 && footprint < 50) {
+    checklist.push('Consider splitting model if stability issues occur');
+  }
+
+  // High risk
+  if (riskLevel === 'high') {
+    checklist.push('Run a test print or scale down first to validate settings');
+  }
+
+  return checklist;
+};
+
+// Main print plan generator
+export const generatePrintPlan = (
+  model: ModelInput,
+  printer: PrinterMaterial,
+  riskLevel: RiskLevel
+): PrintPlan => {
+  const orientation = generateOrientation(model);
+  const supports = generateSupportsRecommendation(model, printer);
+  const walls = calculateWalls(model, printer);
+  const infill = calculateInfill(model, printer);
+  const adhesion = generateAdhesionRecommendation(model, printer);
+  const speedNotes = generateSpeedNotes(model, printer, riskLevel);
+  const materialNotes = generateMaterialNotes(printer);
+  const mitigationChecklist = generateMitigationChecklist(model, printer, riskLevel);
+
+  return {
+    orientation,
+    supports,
+    walls,
+    infill,
+    adhesion,
+    speedNotes,
+    materialNotes,
+    mitigationChecklist,
+  };
+};
