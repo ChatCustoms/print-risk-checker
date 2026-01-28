@@ -1,4 +1,4 @@
-import { Assessment, ModelInput, PrinterMaterial } from '../types/index.ts';
+import type { Assessment, ModelInput, PrinterMaterial } from '../types/index.ts';
 import { STORAGE_KEYS } from '../utils/constants.ts';
 
 // Generate unique ID for assessments

@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { PrinterMaterial as PrinterMaterialType } from '../types/index.ts';
+import type { PrinterMaterial as PrinterMaterialType } from '../types/index.ts';
 import { getSessionModelInput, generateId, saveAssessment } from '../services/storage.ts';
 import { assessRisk } from '../services/riskAssessment.ts';
 import { generatePrintPlan } from '../services/printPlanGenerator.ts';

@@ -1,4 +1,4 @@
-import { Assessment } from '../types/index.ts';
+import type { Assessment } from '../types/index.ts';
 import jsPDF from 'jspdf';
 import { saveAs } from 'file-saver';
 

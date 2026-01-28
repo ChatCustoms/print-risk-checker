@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Assessment } from '../types/index.ts';
+import type { Assessment } from '../types/index.ts';
 import { saveAssessment, clearSessionData } from '../services/storage.ts';
 import { downloadMarkdownReport, generatePDFReport } from '../services/reportGenerator.ts';
 import { countUnknowns } from '../services/riskAssessment.ts';

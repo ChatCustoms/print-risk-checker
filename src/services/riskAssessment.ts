@@ -1,5 +1,4 @@
-import { ModelInput, PrinterMaterial, RiskFactor, RiskLevel, ConfidenceLevel } from '../types/index.ts';
-import { RISK_THRESHOLDS, MATERIAL_PROPERTIES } from '../utils/constants.ts';
+import type { ModelInput, PrinterMaterial, RiskFactor, RiskLevel, ConfidenceLevel } from '../types/index.ts';
 
 // Count unknown fields in model input
 export const countUnknowns = (model: ModelInput): number => {
@@ -13,107 +12,247 @@ export const countUnknowns = (model: ModelInput): number => {
 };
 
 // Calculate confidence level based on unknowns
+// 0-1 unknowns = High, 2-3 = Medium, 4+ = Low
 export const calculateConfidence = (unknownCount: number): ConfidenceLevel => {
-  if (unknownCount >= RISK_THRESHOLDS.UNKNOWN_COUNT_LOW_CONFIDENCE) return 'low';
-  if (unknownCount >= RISK_THRESHOLDS.UNKNOWN_COUNT_MEDIUM_CONFIDENCE) return 'medium';
+  if (unknownCount >= 4) return 'low';
+  if (unknownCount >= 2) return 'medium';
   return 'high';
 };
 
-// Assess geometry risks
-const assessGeometryRisks = (
+// Compute derived values
+const getDerivedValues = (model: ModelInput) => {
+  const footprint_mm2 = model.boundingBox.x * model.boundingBox.y;
+  const slenderness = model.boundingBox.z / Math.max(model.boundingBox.x, model.boundingBox.y);
+  const base_ratio = Math.min(model.boundingBox.x, model.boundingBox.y) / Math.max(model.boundingBox.x, model.boundingBox.y);
+
+  return { footprint_mm2, slenderness, base_ratio };
+};
+
+// A) Print Stability & Tall-Part Risk
+const assessStabilityRisks = (
+  model: ModelInput,
+  derived: ReturnType<typeof getDerivedValues>,
+  riskFactors: RiskFactor[]
+): number => {
+  let points = 0;
+
+  // A1 - Tall/slender part
+  if (derived.slenderness > 3.0) {
+    riskFactors.push({
+      severity: 'high',
+      category: 'geometry',
+      message: `Very tall/slender part (ratio ${derived.slenderness.toFixed(1)}:1) → wobble, adhesion, or layer shift risk (+18)`,
+      mitigation: 'Add brim, slow down, increase cooling, re-orient, or split model',
+    });
+    points += 18;
+  } else if (derived.slenderness > 2.0) {
+    riskFactors.push({
+      severity: 'medium',
+      category: 'geometry',
+      message: `Tall/slender part (ratio ${derived.slenderness.toFixed(1)}:1) → stability risk (+10)`,
+      mitigation: 'Add brim, slow down, increase cooling',
+    });
+    points += 10;
+  }
+
+  // A2 - Small footprint relative to height
+  if (model.boundingBox.z >= 180 && derived.footprint_mm2 < 2500) {
+    riskFactors.push({
+      severity: 'high',
+      category: 'geometry',
+      message: `Very tall (${model.boundingBox.z}mm) with small footprint (${derived.footprint_mm2.toFixed(0)}mm²) → high failure risk (+16)`,
+      mitigation: 'Brim/raft, supports as stabilizers, or split model',
+    });
+    points += 16;
+  } else if (model.boundingBox.z >= 120 && derived.footprint_mm2 < 2500) {
+    riskFactors.push({
+      severity: 'medium',
+      category: 'geometry',
+      message: `Tall (${model.boundingBox.z}mm) with small footprint (${derived.footprint_mm2.toFixed(0)}mm²) → stability risk (+10)`,
+      mitigation: 'Brim/raft recommended, consider supports as stabilizers',
+    });
+    points += 10;
+  }
+
+  // A3 - Flat base unknown
+  if (model.flatBase === 'unknown') {
+    riskFactors.push({
+      severity: 'low',
+      category: 'geometry',
+      message: 'Flat base unknown → base geometry critical to first-layer success (+4)',
+      mitigation: 'Confirm base area; consider adding brim',
+    });
+    points += 4;
+  }
+
+  return points;
+};
+
+// B) Walls, Features, and Nozzle Compatibility
+const assessWallFeatureRisks = (
   model: ModelInput,
   printer: PrinterMaterial,
   riskFactors: RiskFactor[]
 ): number => {
-  let score = 0;
+  let points = 0;
 
-  // Check tall + small footprint (wobble risk)
-  const footprint = Math.min(model.boundingBox.x, model.boundingBox.y);
-  const aspectRatio = model.boundingBox.z / footprint;
-
-  if (aspectRatio > RISK_THRESHOLDS.TALL_SMALL_RATIO && footprint < RISK_THRESHOLDS.SMALL_FOOTPRINT_MM) {
-    riskFactors.push({
-      severity: 'high',
-      category: 'geometry',
-      message: `Tall part (${model.boundingBox.z}mm) with small footprint (${footprint}mm) → high wobble/layer shift risk`,
-      mitigation: 'Use brim for better adhesion, reduce print speed, enable supports if needed',
-    });
-    score += 3;
-  } else if (aspectRatio > RISK_THRESHOLDS.TALL_SMALL_RATIO) {
-    riskFactors.push({
-      severity: 'medium',
-      category: 'geometry',
-      message: `Tall part with aspect ratio ${aspectRatio.toFixed(1)}:1 → moderate stability risk`,
-      mitigation: 'Consider adding brim for stability',
-    });
-    score += 2;
-  }
-
-  // Check wall thickness
+  // B1 - Minimum wall thickness vs nozzle
   if (typeof model.minWallThickness === 'number') {
-    const minRecommended = printer.nozzleSize * RISK_THRESHOLDS.THIN_WALL_MULTIPLIER;
-    if (model.minWallThickness < printer.nozzleSize) {
+    if (model.minWallThickness < (2 * printer.nozzleSize)) {
       riskFactors.push({
         severity: 'high',
         category: 'geometry',
-        message: `Minimum wall thickness (${model.minWallThickness}mm) < nozzle size (${printer.nozzleSize}mm) → unprintable`,
-        mitigation: 'Increase wall thickness in CAD or use smaller nozzle',
+        message: `Min wall (${model.minWallThickness}mm) < 2× nozzle (${(2 * printer.nozzleSize).toFixed(1)}mm) → walls may fail or be fragile (+18)`,
+        mitigation: 'Increase wall thickness in CAD, use smaller nozzle, or increase perimeters',
       });
-      score += 3;
-    } else if (model.minWallThickness < minRecommended) {
+      points += 18;
+    } else if (model.minWallThickness < (3 * printer.nozzleSize)) {
       riskFactors.push({
         severity: 'medium',
         category: 'geometry',
-        message: `Thin walls (${model.minWallThickness}mm) detected → fragility risk`,
-        mitigation: `Recommended minimum: ${minRecommended.toFixed(1)}mm for ${printer.nozzleSize}mm nozzle`,
+        message: `Min wall (${model.minWallThickness}mm) < 3× nozzle (${(3 * printer.nozzleSize).toFixed(1)}mm) → reduced strength (+10)`,
+        mitigation: 'Consider increasing wall thickness or adding perimeters',
       });
-      score += 2;
+      points += 10;
     }
-  }
-
-  // Check flat base
-  if (model.flatBase === 'no') {
-    riskFactors.push({
-      severity: 'medium',
-      category: 'geometry',
-      message: 'No flat base → adhesion and stability risk',
-      mitigation: 'Use brim or raft, consider reorienting the model',
-    });
-    score += 2;
-  }
-
-  // Check overhangs
-  if ((model.overhangs === 'many' || model.overhangs === 'some') && !printer.supportsAllowed) {
-    const severity = model.overhangs === 'many' ? 'high' : 'medium';
-    riskFactors.push({
-      severity,
-      category: 'settings',
-      message: `${model.overhangs === 'many' ? 'Many' : 'Some'} overhangs detected but supports disabled → surface quality/failure risk`,
-      mitigation: 'Enable supports or reorient model to minimize overhangs',
-    });
-    score += severity === 'high' ? 3 : 2;
-  } else if (model.overhangs === 'many') {
+  } else {
     riskFactors.push({
       severity: 'low',
       category: 'geometry',
-      message: 'Many overhangs detected → supports will be required',
-      mitigation: 'Ensure support settings are properly configured',
+      message: 'Min wall thickness unknown → cannot verify nozzle compatibility (+6)',
+      mitigation: 'Check model walls are at least 2-3× nozzle width',
     });
-    score += 1;
+    points += 6;
   }
 
-  // Check bridges
+  // B2 - Minimum feature size vs nozzle
+  if (typeof model.smallestFeature === 'number') {
+    if (model.smallestFeature < (1.2 * printer.nozzleSize)) {
+      riskFactors.push({
+        severity: 'high',
+        category: 'geometry',
+        message: `Min feature (${model.smallestFeature}mm) < 1.2× nozzle (${(1.2 * printer.nozzleSize).toFixed(1)}mm) → details may not resolve (+14)`,
+        mitigation: 'Scale model up, switch to smaller nozzle, or increase line width control',
+      });
+      points += 14;
+    } else if (model.smallestFeature < (2.0 * printer.nozzleSize)) {
+      riskFactors.push({
+        severity: 'medium',
+        category: 'geometry',
+        message: `Min feature (${model.smallestFeature}mm) < 2× nozzle (${(2.0 * printer.nozzleSize).toFixed(1)}mm) → fine details at risk (+8)`,
+        mitigation: 'Consider smaller nozzle for better detail resolution',
+      });
+      points += 8;
+    }
+  } else {
+    riskFactors.push({
+      severity: 'low',
+      category: 'geometry',
+      message: 'Min feature size unknown → detail resolution uncertain (+4)',
+      mitigation: 'Verify fine features are at least 2× nozzle width',
+    });
+    points += 4;
+  }
+
+  return points;
+};
+
+// C) Overhangs & Supports Logic
+const assessOverhangRisks = (
+  model: ModelInput,
+  printer: PrinterMaterial,
+  riskFactors: RiskFactor[]
+): number => {
+  let points = 0;
+
+  // C1 - Overhangs present
+  if (model.overhangs === 'many') {
+    points += 16;
+  } else if (model.overhangs === 'some') {
+    points += 8;
+  } else if (model.overhangs === 'unknown') {
+    riskFactors.push({
+      severity: 'low',
+      category: 'geometry',
+      message: 'Overhangs unknown → support needs uncertain (+5)',
+      mitigation: 'Review model for overhangs >45-50°',
+    });
+    points += 5;
+  }
+
+  // C2 - Supports disabled but overhangs exist
+  if (!printer.supportsAllowed && (model.overhangs === 'some' || model.overhangs === 'many')) {
+    riskFactors.push({
+      severity: 'high',
+      category: 'settings',
+      message: `Supports disabled with ${model.overhangs} overhangs → top failure mode (+18)`,
+      mitigation: 'Allow supports, re-orient model, or split model',
+    });
+    points += 18;
+  } else if (model.overhangs === 'many') {
+    riskFactors.push({
+      severity: 'medium',
+      category: 'geometry',
+      message: 'Many overhangs present → supports required (+16 already counted)',
+      mitigation: 'Use tree supports or touching build plate only',
+    });
+  } else if (model.overhangs === 'some') {
+    riskFactors.push({
+      severity: 'low',
+      category: 'geometry',
+      message: 'Some overhangs present → support planning needed (+8 already counted)',
+      mitigation: 'Enable supports for overhangs >50-60°',
+    });
+  }
+
+  return points;
+};
+
+// D) Bridges
+const assessBridgeRisks = (
+  model: ModelInput,
+  riskFactors: RiskFactor[]
+): number => {
+  let points = 0;
+
   if (model.bridges === 'many') {
     riskFactors.push({
       severity: 'medium',
       category: 'geometry',
-      message: 'Many bridges detected → cooling and speed critical',
-      mitigation: 'Increase cooling, reduce speed for bridges, test bridge settings first',
+      message: 'Many bridges expected → cooling/speed tuning critical (+12)',
+      mitigation: 'Increase cooling, reduce bridge speed, add supports if bridges sag',
     });
-    score += 2;
+    points += 12;
+  } else if (model.bridges === 'some') {
+    riskFactors.push({
+      severity: 'low',
+      category: 'geometry',
+      message: 'Some bridges expected → monitor cooling and speed (+6)',
+      mitigation: 'Ensure cooling is adequate for material, test bridge settings',
+    });
+    points += 6;
+  } else if (model.bridges === 'unknown') {
+    riskFactors.push({
+      severity: 'low',
+      category: 'geometry',
+      message: 'Bridges unknown → bridging performance uncertain (+4)',
+      mitigation: 'Review model for unsupported gaps',
+    });
+    points += 4;
   }
 
-  // Check part size vs bed
+  return points;
+};
+
+// E) Size & Fit Constraints
+const assessSizeConstraints = (
+  model: ModelInput,
+  printer: PrinterMaterial,
+  riskFactors: RiskFactor[]
+): number => {
+  let points = 0;
+
+  // E1 - Bed fit
   if (printer.bedSize) {
     const fitsX = model.boundingBox.x <= printer.bedSize.x;
     const fitsY = model.boundingBox.y <= printer.bedSize.y;
@@ -123,140 +262,170 @@ const assessGeometryRisks = (
       riskFactors.push({
         severity: 'high',
         category: 'printer',
-        message: `Model (${model.boundingBox.x}×${model.boundingBox.y}×${model.boundingBox.z}mm) exceeds bed size → cannot print`,
-        mitigation: 'Split model into smaller parts or use larger printer',
+        message: `Model (${model.boundingBox.x}×${model.boundingBox.y}×${model.boundingBox.z}mm) exceeds bed → cannot print in one piece (+30)`,
+        mitigation: 'Split model, rotate, scale, or print diagonally',
       });
-      score += 3;
+      points += 30;
     }
   }
 
-  // Check large part warping risk
-  const largestDimension = Math.max(model.boundingBox.x, model.boundingBox.y);
-  if (largestDimension > RISK_THRESHOLDS.LARGE_PART_THRESHOLD) {
-    if (printer.material === 'ABS' || printer.material === 'Nylon') {
-      riskFactors.push({
-        severity: 'high',
-        category: 'material',
-        message: `Large ${printer.material} part (${largestDimension}mm) → high warping risk`,
-        mitigation: 'Use enclosure, brim/raft, heated bed, and slow cooling',
-      });
-      score += 3;
-    } else {
-      riskFactors.push({
-        severity: 'low',
-        category: 'geometry',
-        message: `Large part (${largestDimension}mm) → monitor first layer adhesion`,
-        mitigation: 'Consider using brim for better adhesion',
-      });
-      score += 1;
-    }
+  // E2 - Very large part (time & warp risk)
+  const maxDim = Math.max(model.boundingBox.x, model.boundingBox.y, model.boundingBox.z);
+  if (maxDim >= 220) {
+    riskFactors.push({
+      severity: 'medium',
+      category: 'geometry',
+      message: `Large part (${maxDim}mm) → long print amplifies warp, drift, adhesion issues (+10)`,
+      mitigation: 'Brim, enclosure (for ABS/Nylon), or segment model',
+    });
+    points += 10;
   }
 
-  return score;
+  return points;
 };
 
-// Assess material risks
+// F) Intended Use (Decorative vs Functional vs Fit-Critical)
+const assessIntendedUseRisks = (
+  model: ModelInput,
+  riskFactors: RiskFactor[]
+): number => {
+  let points = 0;
+
+  if (model.intendedUse === 'functional') {
+    riskFactors.push({
+      severity: 'low',
+      category: 'settings',
+      message: 'Functional part → needs stronger walls/infill and tougher material (+6)',
+      mitigation: 'More perimeters, higher infill, consider PETG/ABS/Nylon',
+    });
+    points += 6;
+  } else if (model.intendedUse === 'fit-critical') {
+    riskFactors.push({
+      severity: 'medium',
+      category: 'settings',
+      message: 'Fit-critical part → tolerances, shrinkage, dimensional error matter (+14)',
+      mitigation: 'Calibration, test coupon, adjust XY compensation, print slower',
+    });
+    points += 14;
+  }
+
+  return points;
+};
+
+// G) Material-Specific Risk Adjustments
 const assessMaterialRisks = (
   model: ModelInput,
   printer: PrinterMaterial,
   riskFactors: RiskFactor[]
 ): number => {
-  let score = 0;
-  const materialInfo = MATERIAL_PROPERTIES[printer.material];
+  let points = 0;
 
-  // Check material vs use case
-  if (model.intendedUse === 'functional') {
-    if (printer.material === 'PLA') {
+  switch (printer.material) {
+    case 'PLA':
+    case 'PLA+':
+      if (model.intendedUse === 'functional') {
+        riskFactors.push({
+          severity: 'low',
+          category: 'material',
+          message: 'PLA functional part → softening/creep risk under load (+3)',
+          mitigation: 'Consider PETG or ABS for load-bearing parts',
+        });
+        points += 3;
+      }
+      if (model.intendedUse === 'fit-critical') {
+        riskFactors.push({
+          severity: 'low',
+          category: 'material',
+          message: 'PLA fit-critical → dimensional ok, but can creep under load (+2)',
+          mitigation: 'Test fit with actual use-case loads',
+        });
+        points += 2;
+      }
+      break;
+
+    case 'PETG':
+      if (model.overhangs === 'some' || model.overhangs === 'many') {
+        riskFactors.push({
+          severity: 'low',
+          category: 'material',
+          message: 'PETG with overhangs → stringing and droop risk (+3)',
+          mitigation: 'Tune retraction, reduce temp slightly, use supports',
+        });
+        points += 3;
+      }
+      if (model.bridges === 'some' || model.bridges === 'many') {
+        riskFactors.push({
+          severity: 'low',
+          category: 'material',
+          message: 'PETG with bridges → may sag more than PLA (+2)',
+          mitigation: 'Reduce bridge speed, increase cooling within limits',
+        });
+        points += 2;
+      }
+      break;
+
+    case 'ABS':
       riskFactors.push({
         severity: 'medium',
         category: 'material',
-        message: 'Functional part + PLA → limited strength and heat resistance (~60°C)',
-        mitigation: 'Consider PETG, ABS, or Nylon for functional parts',
+        message: 'ABS baseline → warp/shrink risk (+8)',
+        mitigation: 'Use enclosure, brim, heated bed (90-110°C)',
       });
-      score += 2;
-    }
-    if (printer.material === 'TPU') {
-      riskFactors.push({
-        severity: 'high',
-        category: 'material',
-        message: 'Functional part + TPU → TPU is flexible, not suitable for rigid functional parts',
-        mitigation: 'Use rigid material like PETG or ABS for functional parts',
-      });
-      score += 3;
-    }
-  }
+      points += 8;
 
-  if (model.intendedUse === 'fit-critical') {
-    if (printer.material === 'ABS' || printer.material === 'Nylon') {
+      if (model.flatBase === 'no') {
+        riskFactors.push({
+          severity: 'low',
+          category: 'material',
+          message: 'ABS with no flat base → increased warping (+4)',
+          mitigation: 'Add raft, ensure enclosure, slow cooling',
+        });
+        points += 4;
+      }
+      break;
+
+    case 'Nylon':
       riskFactors.push({
         severity: 'medium',
         category: 'material',
-        message: `Fit-critical part + ${printer.material} → warping can affect dimensional accuracy`,
-        mitigation: 'Use PETG or PLA+ for better dimensional stability, calibrate first',
+        message: 'Nylon baseline → moisture absorption + warp risk (+10)',
+        mitigation: 'Dry filament before printing, use enclosure, expect shrinkage',
       });
-      score += 2;
-    }
-  }
+      points += 10;
 
-  // Add material-specific warnings
-  if (materialInfo.warnings.length > 0) {
-    const warningMessage = materialInfo.warnings.join(', ');
-    riskFactors.push({
-      severity: 'low',
-      category: 'material',
-      message: `${printer.material} material notes: ${warningMessage}`,
-      mitigation: materialInfo.notes,
-    });
-    score += 1;
-  }
+      if (model.intendedUse === 'fit-critical') {
+        riskFactors.push({
+          severity: 'low',
+          category: 'material',
+          message: 'Nylon fit-critical → shrink variability affects tolerances (+4)',
+          mitigation: 'Print test coupon, adjust XY compensation',
+        });
+        points += 4;
+      }
+      break;
 
-  return score;
-};
-
-// Assess settings risks
-const assessSettingsRisks = (
-  model: ModelInput,
-  printer: PrinterMaterial,
-  riskFactors: RiskFactor[]
-): number => {
-  let score = 0;
-
-  // Check speed priority vs quality needs
-  if (printer.priority === 'speed' && model.intendedUse === 'fit-critical') {
-    riskFactors.push({
-      severity: 'medium',
-      category: 'settings',
-      message: 'Speed priority + fit-critical part → dimensional accuracy may suffer',
-      mitigation: 'Reduce speed for outer walls and critical dimensions',
-    });
-    score += 2;
-  }
-
-  // Check adhesion method
-  if (model.flatBase === 'no' && printer.priority === 'speed') {
-    riskFactors.push({
-      severity: 'medium',
-      category: 'settings',
-      message: 'No flat base + speed priority → adhesion failure risk',
-      mitigation: 'Use brim or raft, slow down first layer',
-    });
-    score += 2;
-  }
-
-  // Check layer height vs detail
-  if (typeof model.smallestFeature === 'number') {
-    if (model.smallestFeature < printer.layerHeight * 2) {
+    case 'TPU':
       riskFactors.push({
-        severity: 'high',
-        category: 'settings',
-        message: `Smallest feature (${model.smallestFeature}mm) < 2× layer height (${printer.layerHeight}mm) → detail loss`,
-        mitigation: 'Reduce layer height or increase feature size in CAD',
+        severity: 'medium',
+        category: 'material',
+        message: 'TPU baseline → requires slow speeds and extrusion control (+10)',
+        mitigation: 'Print 20-40mm/s, reduce retraction, direct drive preferred',
       });
-      score += 3;
-    }
+      points += 10;
+
+      if (typeof model.smallestFeature === 'number' && model.smallestFeature < 2.0) {
+        riskFactors.push({
+          severity: 'low',
+          category: 'material',
+          message: 'TPU with fine features → flex makes details harder (+6)',
+          mitigation: 'Increase perimeters, reduce speed further',
+        });
+        points += 6;
+      }
+      break;
   }
 
-  return score;
+  return points;
 };
 
 // Main risk assessment function
@@ -265,36 +434,53 @@ export const assessRisk = (
   printer: PrinterMaterial
 ): { riskLevel: RiskLevel; confidence: ConfidenceLevel; riskFactors: RiskFactor[] } => {
   const riskFactors: RiskFactor[] = [];
-  let totalScore = 0;
+  let risk_points = 0;
 
-  // Run all risk assessments
-  totalScore += assessGeometryRisks(model, printer, riskFactors);
-  totalScore += assessMaterialRisks(model, printer, riskFactors);
-  totalScore += assessSettingsRisks(model, printer, riskFactors);
+  // Compute derived values
+  const derived = getDerivedValues(model);
 
-  // Determine risk level
+  // Run all rule groups
+  risk_points += assessStabilityRisks(model, derived, riskFactors);
+  risk_points += assessWallFeatureRisks(model, printer, riskFactors);
+  risk_points += assessOverhangRisks(model, printer, riskFactors);
+  risk_points += assessBridgeRisks(model, riskFactors);
+  risk_points += assessSizeConstraints(model, printer, riskFactors);
+  risk_points += assessIntendedUseRisks(model, riskFactors);
+  risk_points += assessMaterialRisks(model, printer, riskFactors);
+
+  // Determine risk level: 0-19 = LOW, 20-39 = MEDIUM, 40+ = HIGH
   let riskLevel: RiskLevel;
-  if (totalScore >= RISK_THRESHOLDS.RISK_SCORE_HIGH) {
+  if (risk_points >= 40) {
     riskLevel = 'high';
-  } else if (totalScore >= RISK_THRESHOLDS.RISK_SCORE_MEDIUM) {
+  } else if (risk_points >= 20) {
     riskLevel = 'medium';
   } else {
     riskLevel = 'low';
   }
 
-  // Add positive note if low risk
+  // Add positive note if low risk and no factors
   if (riskLevel === 'low' && riskFactors.length === 0) {
     riskFactors.push({
       severity: 'low',
       category: 'geometry',
-      message: 'Model appears well-suited for printing with current settings',
+      message: 'No significant risks detected → model appears well-suited for printing',
       mitigation: 'Proceed with standard print settings',
     });
   }
 
-  // Calculate confidence
+  // Calculate confidence: 0-1 = High, 2-3 = Medium, 4+ = Low
   const unknownCount = countUnknowns(model);
   const confidence = calculateConfidence(unknownCount);
+
+  // Add confidence note if low
+  if (confidence === 'low') {
+    riskFactors.push({
+      severity: 'low',
+      category: 'settings',
+      message: `Results based on incomplete geometry inputs (${unknownCount} unknowns)`,
+      mitigation: 'Provide more details for more accurate assessment',
+    });
+  }
 
   // Sort risk factors by severity (high → medium → low)
   const severityOrder = { high: 0, medium: 1, low: 2 };

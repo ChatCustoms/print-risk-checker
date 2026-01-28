@@ -1,4 +1,4 @@
-import { RiskLevel } from '../types/index.ts';
+import type { RiskLevel } from '../types/index.ts';
 
 interface RiskBadgeProps {
   level: RiskLevel;

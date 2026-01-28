@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ModelInput as ModelInputType } from '../types/index.ts';
+import type { ModelInput as ModelInputType } from '../types/index.ts';
 import { saveSessionModelInput } from '../services/storage.ts';
 import { ProgressStepper } from '../components/ProgressStepper.tsx';
 

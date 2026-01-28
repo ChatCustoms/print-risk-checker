@@ -1,4 +1,4 @@
-import { ConfidenceLevel } from '../types/index.ts';
+import type { ConfidenceLevel } from '../types/index.ts';
 
 interface ConfidenceMeterProps {
   level: ConfidenceLevel;

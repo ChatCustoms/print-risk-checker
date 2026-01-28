@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { Assessment } from '../types/index.ts';
+import type { Assessment } from '../types/index.ts';
 import { getAllAssessments, deleteAssessment } from '../services/storage.ts';
 import { RiskBadge } from '../components/RiskBadge.tsx';
 
