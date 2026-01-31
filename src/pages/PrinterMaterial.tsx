@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import type { PrinterMaterial as PrinterMaterialType } from '../types/index.ts';
-import { getSessionModelInput, generateId, saveAssessment } from '../services/storage.ts';
+import { getSessionModelInput, generateId } from '../services/storage.ts';
 import { assessRisk } from '../services/riskAssessment.ts';
 import { generatePrintPlan } from '../services/printPlanGenerator.ts';
 import { ProgressStepper } from '../components/ProgressStepper.tsx';
